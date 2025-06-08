@@ -139,7 +139,6 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-*.sh
 .venv
 .vscode
 data
@@ -159,3 +158,12 @@ llm_eval/data
 *.ipynb
 *.output
 *.pdf
+
+# Output directories from validation and test runs
+# These are considered temporary checkpoints/outputs for the purpose of this .gitignore
+fineweb_validation/
+fineweb_validation_*/
+test_output/
+test_nonstreaming_output/
+test_output_fixed/
+test_streaming_output/
