@@ -31,6 +31,18 @@ For reproducing RoBERTa-large experiments, please refer to the [medium_models](h
 
 Our implementation of MeZO is based on [HuggingFace's Trainer](https://github.com/huggingface/transformers/blob/main/src/transformers/trainer.py). We add MeZO to the official implementation of trainer with minimum editing. Please refer to "How to add MeZO to my own code?" section in [large_models](https://github.com/princeton-nlp/MeZO/tree/main/large_models) README for more details.
 
+## Accelerate example
+
+The script `accelerate_mezo.py` demonstrates how to combine MeZO with
+[HuggingFace Accelerate](https://github.com/huggingface/accelerate).  It loads a
+dataset from the `datasets` library and fine-tunes any
+`AutoModelForSequenceClassification` model using zeroth-order optimization.
+
+```bash
+python accelerate_mezo.py --model_name bert-base-uncased --dataset imdb --batch_size 8 --num_epochs 1
+```
+
+
 ## Bugs or questions?
 
 If you have any questions related to the code or the paper, feel free to email Sadhika (`smalladi@princeton.edu`) or Tianyu (`tianyug@princeton.edu`). If you encounter any problems when using the code, or want to report a bug, you can open an issue. Please try to specify the problem with details so we can help you better and quicker!
