@@ -5,10 +5,10 @@
 echo "Starting FineWeb fine-tuning validation..."
 
 # Configuration
-MODEL_NAME="gpt2"  # More stable base model for validation
+MODEL_NAME="Qwen/Qwen3-32B"  # More stable base model for validation
 OUTPUT_DIR="./fineweb_validation"
 MAX_STEPS=50  # Reduced steps to prevent overfitting
-BATCH_SIZE=4
+BATCH_SIZE=1
 LEARNING_RATE=1e-6  # Smaller learning rate for stability
 ZO_EPS=1e-3
 
@@ -34,22 +34,22 @@ python validate_fineweb.py \
 echo "Validation complete!"
 
 # Test with different configurations
-echo -e "\n=== Testing with conservative hyperparameters ==="
-echo "Running validation with GPT-2 and conservative settings..."
-python validate_fineweb.py \
-    --model_name "gpt2" \
-    --output_dir "${OUTPUT_DIR}_gpt2_conservative" \
-    --max_steps 30 \
-    --batch_size 4 \
-    --learning_rate 5e-7 \
-    --zo_eps 1e-3
+# echo -e "\n=== Testing with conservative hyperparameters ==="
+# echo "Running validation with GPT-2 and conservative settings..."
+# python validate_fineweb.py \
+#     --model_name "gpt2" \
+#     --output_dir "${OUTPUT_DIR}_gpt2_conservative" \
+#     --max_steps 30 \
+#     --batch_size 4 \
+#     --learning_rate 5e-7 \
+#     --zo_eps 1e-3
 
-echo -e "\n=== Testing with smaller model ==="
-echo "Running validation with DistilGPT-2..."
-python validate_fineweb.py \
-    --model_name "distilgpt2" \
-    --output_dir "${OUTPUT_DIR}_distilgpt2" \
-    --max_steps 50 \
-    --batch_size 8 \
-    --learning_rate 1e-6 \
-    --zo_eps 1e-3
+# echo -e "\n=== Testing with smaller model ==="
+# echo "Running validation with DistilGPT-2..."
+# python validate_fineweb.py \
+#     --model_name "distilgpt2" \
+#     --output_dir "${OUTPUT_DIR}_distilgpt2" \
+#     --max_steps 50 \
+#     --batch_size 8 \
+#     --learning_rate 1e-6 \
+#     --zo_eps 1e-3

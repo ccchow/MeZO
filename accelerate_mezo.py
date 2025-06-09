@@ -332,48 +332,30 @@ def zo_forward(model, inputs):
 
 def zo_step(model, inputs, named_params, eps, device):
     zo_random_seed = np.random.randint(1000000000)
-
-    # Create a generator for this step
-    generator = torch.Generator(device=device)
-    generator.manual_seed(zo_random_seed)
-
-    # Generate and store z vectors once
-    z_vectors = []
-    for _, param in named_params:
-        z = torch.randn(
-            param.shape,
-            device=param.device,
-            dtype=param.dtype,
-            generator=generator)
-        z_vectors.append(z)
-
-    # First perturbation: +eps
-    zo_perturb_parameters(
-        named_params,
-        eps,
-        scaling_factor=1,
-        z_vectors=z_vectors)
+    
+    # Perturb +eps
+    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
     loss1 = zo_forward(model, inputs)
-
-    # Second perturbation: -2*eps (to get to -eps)
-    zo_perturb_parameters(
-        named_params,
-        eps,
-        scaling_factor=-2,
-        z_vectors=z_vectors)
+    
+    # Perturb -2*eps (to get to -eps from +eps)
+    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=-2)
     loss2 = zo_forward(model, inputs)
-
-    # Restore to original: +eps
-    zo_perturb_parameters(
-        named_params,
-        eps,
-        scaling_factor=1,
-        z_vectors=z_vectors)
-
-    # Calculate projected gradient
+    
+    # Restore to original
+    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
+    
     projected_grad = ((loss1 - loss2) / (2 * eps)).item()
+    
+    return loss1, projected_grad, zo_random_seed  # Return seed, not z_vectors
 
-    return loss1, projected_grad, z_vectors
+def perturb_parameters(named_params, eps, random_seed, scaling_factor):
+    """Perturb parameters using a specific random seed"""
+    torch.manual_seed(random_seed)
+    
+    for name, param in named_params:
+        z = torch.normal(mean=0, std=1, size=param.shape,
+                        device=param.device, dtype=param.dtype)
+        param.data.add_(z, alpha=scaling_factor * eps)
 
 
 def synchronize_params(model, accelerator):
@@ -391,29 +373,24 @@ def synchronize_params(model, accelerator):
         accelerator.wait_for_everyone()
 
 
-def zo_update(
-        named_params,
-        lr_scheduler,
-        projected_grad,
-        z_vectors,
-        lr,
-        weight_decay):
-    # Clip gradient to prevent explosion
+def zo_update(named_params, lr_scheduler, projected_grad, zo_random_seed, lr, weight_decay):
+    """Update parameters by regenerating the same z vectors"""
     projected_grad = max(min(projected_grad, 1000.0), -1000.0)
-
-    # Get current learning rate from scheduler
-    # Multiply by base lr since optimizer has lr=1.0
     current_lr = lr_scheduler.get_last_lr()[0] * lr
-
-    for (name, param), z in zip(named_params, z_vectors):
+    
+    # Reset to same seed to regenerate same z vectors
+    torch.manual_seed(zo_random_seed)
+    
+    for name, param in named_params:
+        z = torch.normal(mean=0, std=1, size=param.shape,
+                        device=param.device, dtype=param.dtype)
+        
         if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-            # Apply gradient and weight decay together
             param.data.mul_(1 - current_lr * weight_decay)
             param.data.add_(z, alpha=-current_lr * projected_grad)
         else:
             param.data.add_(z, alpha=-current_lr * projected_grad)
-
-    # Step the scheduler (but not the optimizer!)
+    
     lr_scheduler.step()
 
 
@@ -422,60 +399,38 @@ def zo_step_with_sync(model, inputs, named_params, eps, device, accelerator):
     # Ensure all processes use the same random seed
     zo_random_seed = np.random.randint(1000000000)
     if accelerator.num_processes > 1:
-        zo_random_seed = torch.tensor(zo_random_seed, device=device)
-        zo_random_seed = accelerator.gather(
-            zo_random_seed)[0]  # Use first process's seed
-        zo_random_seed = zo_random_seed.item()
+        # Create tensor on CPU first, then move to device
+        zo_random_seed_tensor = torch.tensor(zo_random_seed, dtype=torch.long)
+        zo_random_seed_tensor = zo_random_seed_tensor.to(device)
+        zo_random_seed_tensor = accelerator.gather(zo_random_seed_tensor)[0]
+        zo_random_seed = zo_random_seed_tensor.item()
 
-    # Create a generator for this step
-    generator = torch.Generator(device=device)
-    generator.manual_seed(zo_random_seed)
-
-    # Generate and store z vectors once
-    z_vectors = []
-    for _, param in named_params:
-        z = torch.randn(
-            param.shape,
-            device=param.device,
-            dtype=param.dtype,
-            generator=generator)
-        z_vectors.append(z)
+    # Use the synchronized seed for all operations
+    torch.manual_seed(zo_random_seed)
 
     # Synchronize before perturbation
     accelerator.wait_for_everyone()
 
     # First perturbation: +eps
-    zo_perturb_parameters(
-        named_params,
-        eps,
-        scaling_factor=1,
-        z_vectors=z_vectors)
+    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
     accelerator.wait_for_everyone()
 
     loss1 = zo_forward(model, inputs)
 
     # Second perturbation: -2*eps (to get to -eps)
-    zo_perturb_parameters(
-        named_params,
-        eps,
-        scaling_factor=-2,
-        z_vectors=z_vectors)
+    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=-2)
     accelerator.wait_for_everyone()
 
     loss2 = zo_forward(model, inputs)
 
     # Restore to original: +eps
-    zo_perturb_parameters(
-        named_params,
-        eps,
-        scaling_factor=1,
-        z_vectors=z_vectors)
+    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
     accelerator.wait_for_everyone()
 
     # Calculate projected gradient
     projected_grad = ((loss1 - loss2) / (2 * eps)).item()
 
-    return loss1, projected_grad, z_vectors
+    return loss1, projected_grad, zo_random_seed
 
 
 if __name__ == "__main__":
@@ -495,28 +450,30 @@ if __name__ == "__main__":
             tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
     # Load model for causal language modeling
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="auto")
+
+    model.gradient_checkpointing_enable()
 
     # Apply FSDP to transformer layers only if running in distributed mode
-    if (torch.distributed.is_available() and
-            torch.distributed.is_initialized()):
-        if (hasattr(model, 'transformer') and
-                hasattr(model.transformer, 'h')):
-            # GPT-2, GPT-Neo, GPT-J, etc.
-            for layer in model.transformer.h:
-                fully_shard(layer)
-        elif (hasattr(model, 'model') and
-              hasattr(model.model, 'layers')):
-            # LLaMA, Mistral, Phi, etc.
-            for layer in model.model.layers:
-                fully_shard(layer)
-        elif (hasattr(model, 'encoder') and
-              hasattr(model.encoder, 'layer')):
-            # BERT, RoBERTa, etc.
-            for layer in model.encoder.layer:
-                fully_shard(layer)
+    # if (torch.distributed.is_available() and
+    #         torch.distributed.is_initialized()):
+    #     if (hasattr(model, 'transformer') and
+    #             hasattr(model.transformer, 'h')):
+    #         # GPT-2, GPT-Neo, GPT-J, etc.
+    #         for layer in model.transformer.h:
+    #             fully_shard(layer)
+    #     elif (hasattr(model, 'model') and
+    #           hasattr(model.model, 'layers')):
+    #         # LLaMA, Mistral, Phi, etc.
+    #         for layer in model.model.layers:
+    #             fully_shard(layer)
+    #     elif (hasattr(model, 'encoder') and
+    #           hasattr(model.encoder, 'layer')):
+    #         # BERT, RoBERTa, etc.
+    #         for layer in model.encoder.layer:
+    #             fully_shard(layer)
 
-        fully_shard(model)
+    #     fully_shard(model)
 
     # Resize token embeddings if we added new tokens
     if len(tokenizer) > model.config.vocab_size:
@@ -551,9 +508,9 @@ if __name__ == "__main__":
     )
 
     # Prepare with accelerator BEFORE getting named parameters
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
+    # model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    #     model, optimizer, train_dataloader, lr_scheduler
+    # )
 
     # Get named parameters AFTER accelerator.prepare()
     named_params = [(n, p)
@@ -577,12 +534,16 @@ if __name__ == "__main__":
                 break
 
             try:
+                # Move batch to the correct device
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
                 # Use synchronized version for multi-GPU
                 if accelerator.num_processes > 1:
-                    loss, grad, z_vectors = zo_step_with_sync(
+                    loss, grad, seed = zo_step_with_sync(
                         model, batch, named_params, args.zo_eps, device, accelerator)
                 else:
-                    loss, grad, z_vectors = zo_step(
+                    loss, grad, seed = zo_step(
                         model, batch, named_params, args.zo_eps, device)
 
                 # Skip update if gradient is NaN or too large
@@ -597,7 +558,7 @@ if __name__ == "__main__":
                     named_params,
                     lr_scheduler,
                     grad,
-                    z_vectors,
+                    seed,  # Pass seed instead of z_vectors
                     args.learning_rate,
                     args.weight_decay)
 
