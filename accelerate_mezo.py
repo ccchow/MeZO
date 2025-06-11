@@ -1,8 +1,10 @@
 import argparse
+import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 import numpy as np
 import torch
+import os
 from torch.distributed.fsdp import fully_shard
 from torch.utils.data import DataLoader
 from datasets import (
@@ -13,7 +15,12 @@ from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.optimization import get_scheduler
 from accelerate import Accelerator
-import os
+from peft import (                        # PEFT = LoRA for HF models
+    LoraConfig,
+    get_peft_model,
+    PeftModel,
+    TaskType,
+)
 
 
 @dataclass
@@ -40,6 +47,15 @@ class Arguments:
     # Probability for masking tokens (if using MLM)
     mlm_probability: float = 0.15
     block_size: Optional[int] = None  # Block size for grouping texts
+    # NEW ────────────────────────────────────────────────────────────
+    # LoRA‑specific flags (defaults match common practice)
+    use_lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target: Optional[List[str]] = None  # e.g. ["q_proj", "v_proj"]
+    # When resuming / inference, path to an existing adapter
+    lora_path: Optional[str] = None
 
 
 def parse_args():
@@ -102,6 +118,17 @@ def parse_args():
         default=None,
         help="Block size for grouping texts"
     )
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Enable LoRA fine‑tuning")
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_target", nargs="+",
+                        default=["q_proj", "v_proj"],
+                        help="Module names to apply LoRA to")
+    parser.add_argument("--lora_path", type=str, default=None,
+                        help="Load an existing LoRA adapter from this folder")
+
     args = parser.parse_args()
     return Arguments(**vars(args))
 
@@ -110,7 +137,6 @@ def prepare_dataloader(args, tokenizer):
     # Handle different dataset types
     if args.dataset == "json":
         # Load from JSON file
-        import json
         # Determine JSON file path
         if args.dataset_path and os.path.exists(args.dataset_path):
             json_path = args.dataset_path
@@ -344,7 +370,7 @@ def zo_step(model, inputs, named_params, eps, device):
     # Restore to original
     perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
     
-    projected_grad = ((loss1 - loss2) / (2 * eps)).item()
+    projected_grad = ((loss1 - loss2) / (2 * eps)).item();
     
     return loss1, projected_grad, zo_random_seed  # Return seed, not z_vectors
 
@@ -454,6 +480,39 @@ if __name__ == "__main__":
 
     model.gradient_checkpointing_enable()
 
+    # ─── LoRA integration ───────────────────────────────────────────────
+    if args.use_lora:
+        if args.lora_path is not None and os.path.isdir(args.lora_path):
+            # Resume / inference on an existing adapter
+            print(f"Loading LoRA adapter from {args.lora_path}")
+            model = PeftModel.from_pretrained(
+                model,
+                args.lora_path,
+                is_trainable=True   # keep adapter params requires_grad=True
+            )
+        else:
+            # Fresh LoRA setup
+            lora_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=args.lora_target,
+                inference_mode=False,
+                bias="none",
+            )
+            model = get_peft_model(model, lora_cfg)
+            print(
+                f"LoRA enabled ⇒ r={args.lora_r}, "
+                f"alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
+                f"targets={args.lora_target}"
+            )
+
+        # Note: PEFT automatically freezes base parameters, but LoRA params stay trainable
+        # No need for manual freezing - PEFT handles this correctly
+    # ────────────────────────────────────────────────────────────────────
+
+
     # Apply FSDP to transformer layers only if running in distributed mode
     # if (torch.distributed.is_available() and
     #         torch.distributed.is_initialized()):
@@ -489,10 +548,13 @@ if __name__ == "__main__":
     print(f"Model loaded for text generation: {args.model_name}")
 
     # Create optimizer and scheduler (needed for lr_scheduler.step())
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"Trainable parameter count: {sum(p.numel() for p in trainable_params):,}")
     optimizer = torch.optim.SGD(
-        model.parameters(),
+        trainable_params,
         lr=1.0,
-        weight_decay=0.0)  # No weight decay in optimizer
+        weight_decay=0.0)
+
 
     # Calculate total training steps
     if args.max_steps is not None:
@@ -581,8 +643,18 @@ if __name__ == "__main__":
 
     # Save the model
     if accelerator.is_main_process:
-        # Unwrap the model for saving
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir)
+
+        if args.use_lora:
+            # Save only the adapter (compact, recommended)
+            unwrapped_model.save_pretrained(args.output_dir)
+            # Record the base model id for convenience
+            with open(os.path.join(args.output_dir, "base_model.txt"), "w") as f:
+                f.write(args.model_name + "\n")
+            print(f"LoRA adapter saved to {args.output_dir}")
+        else:
+            # Original full‑model save
+            unwrapped_model.save_pretrained(args.output_dir)
+            print(f"Model saved to {args.output_dir}")
+
         tokenizer.save_pretrained(args.output_dir)
-        print(f"Model and tokenizer saved to {args.output_dir}")
