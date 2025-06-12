@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import os
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from datasets import (
     load_dataset, Dataset, DatasetDict, IterableDataset, IterableDatasetDict
@@ -14,13 +15,17 @@ from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.optimization import get_scheduler
-from accelerate import Accelerator
+from accelerate import (
+    Accelerator,
+    FullyShardedDataParallelPlugin,
+)
 from peft import (                        # PEFT = LoRA for HF models
     LoraConfig,
     get_peft_model,
     PeftModel,
     TaskType,
 )
+from peft.tuners.lora import LoraLayer
 
 
 @dataclass
@@ -124,7 +129,7 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target", nargs="+",
-                        default=["q_proj", "v_proj"],
+                        default=["c_attn", "c_proj"],
                         help="Module names to apply LoRA to")
     parser.add_argument("--lora_path", type=str, default=None,
                         help="Load an existing LoRA adapter from this folder")
@@ -318,6 +323,7 @@ def prepare_dataloader(args, tokenizer):
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,  # Set to True for MLM with BERT-like models
+        pad_to_multiple_of=8,  # Add padding to multiple of 8 for efficiency
         return_tensors="pt"
     )
 
@@ -344,8 +350,15 @@ def zo_forward(model, inputs):
         try:
             outputs = model(**inputs)
             loss = outputs.loss
+            if loss is None:
+                raise ValueError("Model did not return a loss. Ensure labels are provided.")
             return loss.detach()
         except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"OOM in forward pass, cleared cache")
+                raise e
             if "batch_size" in str(e):
                 print(f"Batch size error in forward pass: {e}")
                 # Return a dummy loss to continue training
@@ -357,7 +370,9 @@ def zo_forward(model, inputs):
 
 
 def zo_step(model, inputs, named_params, eps, device):
-    zo_random_seed = np.random.randint(1000000000)
+    """Compute gradient estimate using MeZO algorithm"""
+    # Generate random seed (use torch's RNG for better reproducibility)
+    zo_random_seed = torch.randint(0, 2**31 - 1, (1,)).item()
     
     # Perturb +eps
     perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
@@ -370,17 +385,33 @@ def zo_step(model, inputs, named_params, eps, device):
     # Restore to original
     perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
     
-    projected_grad = ((loss1 - loss2) / (2 * eps)).item();
+    projected_grad = ((loss1 - loss2) / (2 * eps)).item()
     
-    return loss1, projected_grad, zo_random_seed  # Return seed, not z_vectors
+    # More adaptive gradient clipping based on gradient magnitude
+    grad_magnitude = abs(projected_grad)
+    if grad_magnitude > 100:
+        # For very large gradients, clip more aggressively
+        projected_grad = max(min(projected_grad, 50.0), -50.0)
+    elif grad_magnitude > 10:
+        # For moderately large gradients, use moderate clipping
+        projected_grad = max(min(projected_grad, 20.0), -20.0)
+    else:
+        # For normal gradients, use light clipping
+        projected_grad = max(min(projected_grad, 10.0), -10.0)
+    
+    return loss1, projected_grad, zo_random_seed
 
 def perturb_parameters(named_params, eps, random_seed, scaling_factor):
     """Perturb parameters using a specific random seed"""
-    torch.manual_seed(random_seed)
+    # Create a generator for reproducible randomness
+    # Get device from the first parameter
+    device = next(iter(named_params))[1].device if named_params else torch.device('cpu')
+    generator = torch.Generator(device=device)
+    generator.manual_seed(random_seed)
     
     for name, param in named_params:
-        z = torch.normal(mean=0, std=1, size=param.shape,
-                        device=param.device, dtype=param.dtype)
+        z = torch.randn(param.shape, generator=generator,
+                       device=param.device, dtype=param.dtype)
         param.data.add_(z, alpha=scaling_factor * eps)
 
 
@@ -401,57 +432,75 @@ def synchronize_params(model, accelerator):
 
 def zo_update(named_params, lr_scheduler, projected_grad, zo_random_seed, lr, weight_decay):
     """Update parameters by regenerating the same z vectors"""
-    projected_grad = max(min(projected_grad, 1000.0), -1000.0)
+    # Apply the same adaptive clipping as in zo_step
+    grad_magnitude = abs(projected_grad)
+    if grad_magnitude > 100:
+        projected_grad = max(min(projected_grad, 50.0), -50.0)
+    elif grad_magnitude > 10:
+        projected_grad = max(min(projected_grad, 20.0), -20.0)
+    else:
+        projected_grad = max(min(projected_grad, 10.0), -10.0)
+    
     current_lr = lr_scheduler.get_last_lr()[0] * lr
     
     # Reset to same seed to regenerate same z vectors
-    torch.manual_seed(zo_random_seed)
+    # Get device from the first parameter
+    device = next(iter(named_params))[1].device if named_params else torch.device('cpu')
+    generator = torch.Generator(device=device)
+    generator.manual_seed(zo_random_seed)
     
     for name, param in named_params:
-        z = torch.normal(mean=0, std=1, size=param.shape,
-                        device=param.device, dtype=param.dtype)
+        z = torch.randn(param.shape, generator=generator,
+                       device=param.device, dtype=param.dtype)
         
-        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+        # Apply weight decay and update
+        if weight_decay > 0 and "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
             param.data.mul_(1 - current_lr * weight_decay)
-            param.data.add_(z, alpha=-current_lr * projected_grad)
-        else:
-            param.data.add_(z, alpha=-current_lr * projected_grad)
+        
+        param.data.add_(z, alpha=-current_lr * projected_grad)
     
     lr_scheduler.step()
 
 
 def zo_step_with_sync(model, inputs, named_params, eps, device, accelerator):
     """ZO step with proper synchronization for distributed training"""
-    # Ensure all processes use the same random seed
-    zo_random_seed = np.random.randint(1000000000)
+    # Generate seed on rank 0 and broadcast
+    if accelerator.process_index == 0:
+        seed_tensor = torch.randint(0, 2**31 - 1, (1,), device=device)
+    else:
+        seed_tensor = torch.zeros(1, dtype=torch.long, device=device)
+    
+    # Broadcast seed from rank 0 to all processes
     if accelerator.num_processes > 1:
-        # Create tensor on CPU first, then move to device
-        zo_random_seed_tensor = torch.tensor(zo_random_seed, dtype=torch.long)
-        zo_random_seed_tensor = zo_random_seed_tensor.to(device)
-        zo_random_seed_tensor = accelerator.gather(zo_random_seed_tensor)[0]
-        zo_random_seed = zo_random_seed_tensor.item()
+        torch.distributed.broadcast(seed_tensor, src=0)
+    
+    zo_random_seed = seed_tensor.item()
 
     # Use the synchronized seed for all operations
     torch.manual_seed(zo_random_seed)
 
-    # Synchronize before perturbation
-    accelerator.wait_for_everyone()
-
     # First perturbation: +eps
     perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
-    accelerator.wait_for_everyone()
+    
+    # Optional: ensure all processes have the same perturbed parameters
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
 
     loss1 = zo_forward(model, inputs)
 
     # Second perturbation: -2*eps (to get to -eps)
     perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=-2)
-    accelerator.wait_for_everyone()
+    
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
 
     loss2 = zo_forward(model, inputs)
 
     # Restore to original: +eps
     perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
-    accelerator.wait_for_everyone()
+    
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
 
     # Calculate projected gradient
     projected_grad = ((loss1 - loss2) / (2 * eps)).item()
@@ -459,10 +508,80 @@ def zo_step_with_sync(model, inputs, named_params, eps, device, accelerator):
     return loss1, projected_grad, zo_random_seed
 
 
+def build_fsdp_plugin():
+    """Build FSDP plugin with auto-wrapping for transformer blocks"""
+    # Try to import model-specific transformer block classes
+    transformer_cls_set = set()
+    
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        transformer_cls_set.add(Qwen2DecoderLayer)
+    except ImportError:
+        pass
+    
+    try:
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        transformer_cls_set.add(LlamaDecoderLayer)
+    except ImportError:
+        pass
+    
+    try:
+        from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+        transformer_cls_set.add(MistralDecoderLayer)
+    except ImportError:
+        pass
+    
+    try:
+        from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+        transformer_cls_set.add(GPT2Block)
+    except ImportError:
+        pass
+    
+    try:
+        from transformers.models.gptj.modeling_gptj import GPTJBlock
+        transformer_cls_set.add(GPTJBlock)
+    except ImportError:
+        pass
+    
+    try:
+        from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+        transformer_cls_set.add(GPTNeoXLayer)
+    except ImportError:
+        pass
+    
+    # If no specific classes found, let FSDP auto-detect
+    transformer_cls = transformer_cls_set if transformer_cls_set else None
+    
+    return FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        forward_prefetch=True,
+        backward_prefetch="backward_pre",
+        mixed_precision="bf16",
+        sharding_strategy="FULL_SHARD",
+        state_dict_type="full_state_dict",
+        auto_wrap_policy=transformer_auto_wrap_policy if transformer_cls else None,
+        transformer_layer_cls_to_wrap=transformer_cls,
+        ignored_modules={LoraLayer} if transformer_cls else None,
+        use_orig_params=True,  # Important for parameter updates
+    )
+
+
 if __name__ == "__main__":
     args = parse_args()
-    accelerator = Accelerator()
-
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Create FSDP accelerator
+    fsdp_plugin = build_fsdp_plugin() if torch.cuda.device_count() > 1 else None
+    accelerator = Accelerator(
+        mixed_precision="no",  # Disable mixed precision for MeZO
+        fsdp_plugin=fsdp_plugin
+    )
+    
     # Load tokenizer and configure padding token properly
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -476,7 +595,12 @@ if __name__ == "__main__":
             tokenizer.add_special_tokens({'pad_token': '<pad>'})
 
     # Load model for causal language modeling
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="auto")
+    with accelerator.main_process_first():
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, 
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            low_cpu_mem_usage=True,
+        )
 
     model.gradient_checkpointing_enable()
 
@@ -502,37 +626,15 @@ if __name__ == "__main__":
                 bias="none",
             )
             model = get_peft_model(model, lora_cfg)
-            print(
-                f"LoRA enabled ⇒ r={args.lora_r}, "
-                f"alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
-                f"targets={args.lora_target}"
-            )
-
-        # Note: PEFT automatically freezes base parameters, but LoRA params stay trainable
-        # No need for manual freezing - PEFT handles this correctly
-    # ────────────────────────────────────────────────────────────────────
-
-
-    # Apply FSDP to transformer layers only if running in distributed mode
-    # if (torch.distributed.is_available() and
-    #         torch.distributed.is_initialized()):
-    #     if (hasattr(model, 'transformer') and
-    #             hasattr(model.transformer, 'h')):
-    #         # GPT-2, GPT-Neo, GPT-J, etc.
-    #         for layer in model.transformer.h:
-    #             fully_shard(layer)
-    #     elif (hasattr(model, 'model') and
-    #           hasattr(model.model, 'layers')):
-    #         # LLaMA, Mistral, Phi, etc.
-    #         for layer in model.model.layers:
-    #             fully_shard(layer)
-    #     elif (hasattr(model, 'encoder') and
-    #           hasattr(model.encoder, 'layer')):
-    #         # BERT, RoBERTa, etc.
-    #         for layer in model.encoder.layer:
-    #             fully_shard(layer)
-
-    #     fully_shard(model)
+            
+            # Print LoRA parameter statistics
+            if accelerator.is_main_process:
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                all_params = sum(p.numel() for p in model.parameters())
+                print(
+                    f"LoRA enabled: {trainable_params:,} trainable parameters "
+                    f"({trainable_params/all_params:.2%} of {all_params:,} total)"
+                )
 
     # Resize token embeddings if we added new tokens
     if len(tokenizer) > model.config.vocab_size:
@@ -542,12 +644,10 @@ if __name__ == "__main__":
     if model.config.pad_token_id is None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Prepare data loader
-    train_dataloader = prepare_dataloader(args, tokenizer)
-
-    print(f"Model loaded for text generation: {args.model_name}")
-
-    # Create optimizer and scheduler (needed for lr_scheduler.step())
+    # Prepare model with FSDP BEFORE creating optimizer
+    model = accelerator.prepare(model)
+    
+    # NOW create optimizer with the prepared (potentially FSDP-wrapped) model
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Trainable parameter count: {sum(p.numel() for p in trainable_params):,}")
     optimizer = torch.optim.SGD(
@@ -555,6 +655,9 @@ if __name__ == "__main__":
         lr=1.0,
         weight_decay=0.0)
 
+    # Prepare data loader
+    train_dataloader = prepare_dataloader(args, tokenizer)
+    train_dataloader = accelerator.prepare(train_dataloader)
 
     # Calculate total training steps
     if args.max_steps is not None:
@@ -569,17 +672,12 @@ if __name__ == "__main__":
         num_training_steps=total_training_steps
     )
 
-    # Prepare with accelerator BEFORE getting named parameters
-    # model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-    #     model, optimizer, train_dataloader, lr_scheduler
-    # )
-
     # Get named parameters AFTER accelerator.prepare()
     named_params = [(n, p)
                     for n, p in model.named_parameters() if p.requires_grad]
 
     # Get the device from the model
-    device = next(model.parameters()).device
+    device = accelerator.device
 
     # Set model to training mode
     model.train()
@@ -587,9 +685,34 @@ if __name__ == "__main__":
     global_step = 0
     max_steps = args.max_steps if args.max_steps is not None else float('inf')
 
+    # Calculate epsilon based on parameter statistics if not set
+    if args.zo_eps == 1e-3:  # Default value
+        with torch.no_grad():
+            param_stds = []
+            param_norms = []
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    param_stds.append(param.std().item())
+                    param_norms.append(param.norm().item())
+            if param_stds:
+                avg_std = np.mean(param_stds)
+                avg_norm = np.mean(param_norms)
+                # Scale epsilon based on both std and norm for better stability
+                args.zo_eps = min(1e-3 * avg_std, 1e-5 * avg_norm)
+                if accelerator.is_main_process:
+                    print(f"Auto-scaled epsilon to {args.zo_eps:.2e} based on parameter statistics")
+                    print(f"  Average param std: {avg_std:.2e}, Average param norm: {avg_norm:.2e}")
+    
+    # Track gradient statistics for monitoring
+    gradient_history = []
+    
     for epoch in range(args.num_epochs):
         if global_step >= max_steps:
             break
+
+        epoch_loss = 0.0
+        epoch_steps = 0
+        epoch_grads = []
 
         for step, batch in enumerate(train_dataloader):
             if global_step >= max_steps:
@@ -616,6 +739,10 @@ if __name__ == "__main__":
                         print(f"Epoch {epoch} Step {step} Global {global_step} Skipping update - invalid gradient: {grad}")
                     continue
 
+                # Track gradient statistics
+                epoch_grads.append(grad)
+                gradient_history.append(grad)
+                
                 zo_update(
                     named_params,
                     lr_scheduler,
@@ -624,25 +751,58 @@ if __name__ == "__main__":
                     args.learning_rate,
                     args.weight_decay)
 
-                # Synchronize after update in multi-GPU setting
-                if accelerator.num_processes > 1:
+                # Optional: broadcast parameters after update for verification
+                if accelerator.num_processes > 1 and global_step % 100 == 0:
+                    for _, param in named_params:
+                        torch.distributed.broadcast(param.data, src=0)
                     accelerator.wait_for_everyone()
 
                 global_step += 1
 
-                if accelerator.is_main_process and step % 10 == 0:
-                    print(f"Epoch {epoch} Step {step} Global {global_step} Loss {loss.item():.4f} Grad {grad:.4f}")
+                # Track statistics
+                epoch_loss += loss.item()
+                epoch_steps += 1
 
+                # Log more frequently at the beginning
+                log_freq = 10 if global_step < 100 else 50
+                if accelerator.is_main_process and step % log_freq == 0:
+                    avg_loss = epoch_loss / max(epoch_steps, 1)
+                    recent_grads = gradient_history[-100:] if len(gradient_history) >= 100 else gradient_history
+                    grad_std = np.std(recent_grads) if recent_grads else 0
+                    grad_mean = np.mean(np.abs(recent_grads)) if recent_grads else 0
+                    
+                    print(
+                        f"Epoch {epoch}/{args.num_epochs} "
+                        f"Step {step}/{len(train_dataloader)} "
+                        f"Global {global_step}/{total_training_steps} "
+                        f"Loss {loss.item():.4f} (avg: {avg_loss:.4f}) "
+                        f"Grad {grad:.4f} (mean: {grad_mean:.2f}, std: {grad_std:.2f}) "
+                        f"LR {lr_scheduler.get_last_lr()[0] * args.learning_rate:.2e}"
+                    )
+                
             except Exception as e:
                 if accelerator.is_main_process:
                     print(f"Error at step {step}: {e}")
+                    import traceback
+                    traceback.print_exc()
                 continue
 
-        # Keep this - ensures all processes finish the epoch
-        accelerator.wait_for_everyone()
-
+        # End of epoch logging with gradient statistics
+        if accelerator.is_main_process and epoch_steps > 0:
+            epoch_grad_mean = np.mean(np.abs(epoch_grads)) if epoch_grads else 0
+            epoch_grad_std = np.std(epoch_grads) if epoch_grads else 0
+            print(f"Epoch {epoch} completed. Average loss: {epoch_loss/epoch_steps:.4f}")
+            print(f"  Gradient stats - Mean: {epoch_grad_mean:.4f}, Std: {epoch_grad_std:.4f}")
+            
+            # Warn if gradients are frequently clipped
+            clipped_count = sum(1 for g in epoch_grads if abs(g) >= 9.99)
+            if clipped_count > len(epoch_grads) * 0.5:
+                print(f"  WARNING: {clipped_count}/{len(epoch_grads)} gradients were clipped. "
+                      f"Consider adjusting learning rate or epsilon.")
+    
     # Save the model
     if accelerator.is_main_process:
+        accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
 
         if args.use_lora:
