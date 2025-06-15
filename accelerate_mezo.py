@@ -5,7 +5,6 @@ from typing import Optional, List
 import numpy as np
 import torch
 import os
-from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from datasets import (
@@ -61,6 +60,8 @@ class Arguments:
     lora_target: Optional[List[str]] = None  # e.g. ["q_proj", "v_proj"]
     # When resuming / inference, path to an existing adapter
     lora_path: Optional[str] = None
+    # FSDP version to use when multiple GPUs are available
+    fsdp_version: int = 2
 
 
 def parse_args():
@@ -133,6 +134,13 @@ def parse_args():
                         help="Module names to apply LoRA to")
     parser.add_argument("--lora_path", type=str, default=None,
                         help="Load an existing LoRA adapter from this folder")
+    parser.add_argument(
+        "--fsdp_version",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help="Enable FSDP when multiple GPUs are available."
+             " Use 1 or 2 to select the FSDP version.")
 
     args = parser.parse_args()
     return Arguments(**vars(args))
@@ -508,7 +516,7 @@ def zo_step_with_sync(model, inputs, named_params, eps, device, accelerator):
     return loss1, projected_grad, zo_random_seed
 
 
-def build_fsdp_plugin():
+def build_fsdp_plugin(fsdp_version: int = 2):
     """Build FSDP plugin with auto-wrapping for transformer blocks"""
     # Try to import model-specific transformer block classes
     transformer_cls_set = set()
@@ -553,7 +561,7 @@ def build_fsdp_plugin():
     transformer_cls = transformer_cls_set if transformer_cls_set else None
     
     return FullyShardedDataParallelPlugin(
-        fsdp_version=2,
+        fsdp_version=fsdp_version,
         forward_prefetch=True,
         backward_prefetch="backward_pre",
         mixed_precision="bf16",
@@ -576,7 +584,9 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     
     # Create FSDP accelerator
-    fsdp_plugin = build_fsdp_plugin() if torch.cuda.device_count() > 1 else None
+    fsdp_plugin = None
+    if torch.cuda.device_count() > 1:
+        fsdp_plugin = build_fsdp_plugin(args.fsdp_version)
     accelerator = Accelerator(
         mixed_precision="no",  # Disable mixed precision for MeZO
         fsdp_plugin=fsdp_plugin
