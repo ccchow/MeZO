@@ -42,6 +42,8 @@ dataset from the `datasets` library and fine-tunes any
 python accelerate_mezo.py --model_name bert-base-uncased --dataset imdb --batch_size 8 --num_epochs 1
 ```
 
+When running on multiple GPUs, the script can leverage PyTorch FSDP version 2 for memory-efficient sharding. Simply launch through `accelerate` and optionally set `--fsdp_version 2` (the default) to enable it.
+
 
 ## Bugs or questions?
 

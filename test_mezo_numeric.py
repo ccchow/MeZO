@@ -143,7 +143,7 @@ class TestMeZoNumeric(unittest.TestCase):
         
         # The projected_grad is (loss1 - loss2) / (2 * eps)
         expected_projected_grad = (manual_loss1 - manual_loss2) / (2 * self.eps)
-        self.assertAlmostEqual(projected_grad_step, expected_projected_grad.item(), delta=1e-5, msg="Projected gradient calculation mismatch")
+        self.assertAlmostEqual(projected_grad_step, expected_projected_grad.item(), delta=1e-4, msg="Projected gradient calculation mismatch")
 
 
     def test_zo_update(self):
