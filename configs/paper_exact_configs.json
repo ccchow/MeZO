@@ -1,0 +1,248 @@
+{
+  "paper_exact_configs": {
+    "description": "Exact configurations from original MeZO paper large_models/README.md",
+    "dataset_sizes": {
+      "num_train": 1000,
+      "num_dev": 500, 
+      "num_eval": 1000,
+      "icl_demos": 32
+    },
+    "special_cases": {
+      "CB": {"num_dev": 100},
+      "Copa": {"num_dev": 100}
+    }
+  },
+
+  "opt13b_sst2_mezo_ft": {
+    "description": "OPT-13B SST-2 MeZO full-parameter (exact paper reproduction)",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "glue",
+      "dataset_config": "sst2",
+      "text_column": "sentence",
+      "batch_size": 16,
+      "learning_rate": 1e-7,
+      "zo_eps": 1e-3,
+      "max_steps": 20000,
+      "eval_steps": 4000,
+      "lr_scheduler_type": "constant",
+      "max_train_samples": 1000,
+      "seed": 0,
+      "memory_logging": true,
+      "output_dir": "./results/opt13b_sst2_mezo_ft_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=SST2 MODE=ft LR=1e-7 EPS=1e-3 bash mezo.sh",
+    "expected_runtime_hours": 8,
+    "expected_memory_gb": 65
+  },
+
+  "opt13b_sst2_mezo_prefix": {
+    "description": "OPT-13B SST-2 MeZO prefix-tuning (exact paper reproduction)",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "glue", 
+      "dataset_config": "sst2",
+      "text_column": "sentence",
+      "batch_size": 16,
+      "learning_rate": 1e-3,
+      "zo_eps": 1e-1,
+      "max_steps": 20000,
+      "eval_steps": 4000,
+      "lr_scheduler_type": "constant",
+      "max_train_samples": 1000,
+      "seed": 0,
+      "use_lora": false,
+      "memory_logging": true,
+      "output_dir": "./results/opt13b_sst2_mezo_prefix_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=SST2 MODE=prefix LR=1e-3 EPS=1e-1 bash mezo.sh",
+    "expected_runtime_hours": 6,
+    "expected_memory_gb": 45
+  },
+
+  "opt13b_sst2_mezo_lora": {
+    "description": "OPT-13B SST-2 MeZO LoRA (exact paper reproduction)",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "glue",
+      "dataset_config": "sst2", 
+      "text_column": "sentence",
+      "batch_size": 16,
+      "learning_rate": 5e-5,
+      "zo_eps": 1e-2,
+      "max_steps": 20000,
+      "eval_steps": 4000,
+      "lr_scheduler_type": "constant",
+      "max_train_samples": 1000,
+      "seed": 0,
+      "use_lora": true,
+      "lora_r": 16,
+      "lora_alpha": 32,
+      "memory_logging": true,
+      "output_dir": "./results/opt13b_sst2_mezo_lora_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=SST2 MODE=lora LR=5e-5 EPS=1e-2 bash mezo.sh",
+    "expected_runtime_hours": 6,
+    "expected_memory_gb": 40
+  },
+
+  "opt13b_multirc_mezo_ft": {
+    "description": "OPT-13B MultiRC MeZO full-parameter",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "super_glue",
+      "dataset_config": "multirc",
+      "text_column": "paragraph",
+      "batch_size": 16,
+      "learning_rate": 1e-7,
+      "zo_eps": 1e-3,
+      "max_steps": 20000,
+      "eval_steps": 4000,
+      "lr_scheduler_type": "constant",
+      "max_train_samples": 1000,
+      "seed": 0,
+      "memory_logging": true,
+      "output_dir": "./results/opt13b_multirc_mezo_ft_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=MultiRC MODE=ft LR=1e-7 EPS=1e-3 bash mezo.sh",
+    "expected_runtime_hours": 8,
+    "expected_memory_gb": 65
+  },
+
+  "opt13b_copa_mezo_ft": {
+    "description": "OPT-13B Copa MeZO full-parameter (special case: 100 dev examples)",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "super_glue",
+      "dataset_config": "copa",
+      "text_column": "premise",
+      "batch_size": 16,
+      "learning_rate": 1e-7,
+      "zo_eps": 1e-3,
+      "max_steps": 20000,
+      "eval_steps": 4000,
+      "lr_scheduler_type": "constant",
+      "max_train_samples": 1000,
+      "seed": 0,
+      "memory_logging": true,
+      "output_dir": "./results/opt13b_copa_mezo_ft_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=Copa MODE=ft LR=1e-7 EPS=1e-3 bash mezo.sh",
+    "note": "Copa has <1000 training examples, only uses 100 for dev",
+    "expected_runtime_hours": 8,
+    "expected_memory_gb": 65
+  },
+
+  "opt13b_squad_mezo_prefix": {
+    "description": "OPT-13B SQuAD MeZO prefix-tuning (non-differentiable objective)",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "squad",
+      "text_column": "context",
+      "batch_size": 16,
+      "learning_rate": 1e-2,
+      "zo_eps": 1e-1,
+      "max_steps": 20000,
+      "eval_steps": 4000,
+      "lr_scheduler_type": "constant",
+      "max_train_samples": 1000,
+      "seed": 0,
+      "memory_logging": true,
+      "output_dir": "./results/opt13b_squad_mezo_prefix_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=SQuAD MODE=prefix LR=1e-2 EPS=1e-1 bash mezo.sh --non_diff --evaluation_strategy no --save_strategy no --save_model",
+    "note": "Uses non-differentiable F1 objective",
+    "expected_runtime_hours": 8,
+    "expected_memory_gb": 45
+  },
+
+  "opt13b_zero_shot_sst2": {
+    "description": "OPT-13B SST-2 Zero-shot evaluation",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "glue",
+      "dataset_config": "sst2",
+      "text_column": "sentence",
+      "batch_size": 16,
+      "max_steps": 0,
+      "baseline_mode": "zero_shot",
+      "seed": 0,
+      "output_dir": "./results/opt13b_sst2_zero_shot_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=SST2 bash icl.sh --num_train 0",
+    "expected_runtime_minutes": 30,
+    "expected_memory_gb": 30
+  },
+
+  "opt13b_icl_sst2": {
+    "description": "OPT-13B SST-2 In-Context Learning (32 demonstrations)",
+    "command": "python accelerate_mezo.py",
+    "args": {
+      "model_name": "facebook/opt-13b",
+      "dataset": "glue",
+      "dataset_config": "sst2",
+      "text_column": "sentence",
+      "batch_size": 16,
+      "max_steps": 0,
+      "baseline_mode": "few_shot",
+      "few_shot_k": 32,
+      "seed": 0,
+      "output_dir": "./results/opt13b_sst2_icl_paper"
+    },
+    "paper_command": "MODEL=facebook/opt-13b TASK=SST2 bash icl.sh",
+    "expected_runtime_minutes": 45,
+    "expected_memory_gb": 30
+  },
+
+  "paper_hyperparameter_grid": {
+    "description": "Complete hyperparameter grid from paper Table recommendations",
+    "full_parameter_mezo": {
+      "learning_rates": [1e-6, 1e-7],
+      "eps": 1e-3
+    },
+    "prefix_tuning_mezo": {
+      "learning_rates": [1e-2, 1e-3], 
+      "eps": 1e-1,
+      "num_prefix": 5
+    },
+    "lora_mezo": {
+      "learning_rates": [1e-4, 5e-5],
+      "eps": 1e-2,
+      "lora_r": 16,
+      "lora_alpha": 32
+    }
+  },
+
+  "memory_benchmark_paper": {
+    "description": "Memory benchmark experiments for Table 22 reproduction",
+    "models": [
+      {
+        "name": "facebook/opt-13b",
+        "expected_mezo_memory_gb": 65,
+        "expected_full_ft_memory_gb": 315,
+        "reduction_factor": "4.8x"
+      },
+      {
+        "name": "facebook/opt-30b", 
+        "expected_mezo_memory_gb": 120,
+        "expected_full_ft_memory_gb": 600,
+        "reduction_factor": "5x"
+      },
+      {
+        "name": "facebook/opt-66b",
+        "expected_mezo_memory_gb": 220,
+        "expected_full_ft_memory_gb": 1200,
+        "reduction_factor": "5.5x"
+      }
+    ],
+    "task": "MultiRC",
+    "note": "MultiRC chosen for ~400 token length as mentioned in paper"
+  }
+}

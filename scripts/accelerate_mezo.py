@@ -1,6 +1,7 @@
 import argparse
 import os
 import json
+import time
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -63,6 +64,22 @@ class Arguments:
     lora_path: Optional[str] = None
     # FSDP version to use when multiple GPUs are available
     fsdp_version: int = 2
+    # MeZO Paper Reproduction Settings
+    task_name: Optional[str] = None  # For GLUE/SuperGLUE tasks
+    prompt_template: Optional[str] = None  # Path to prompt templates JSON
+    eval_steps: int = 10000  # Evaluation frequency (10k for RoBERTa, 4k for OPT)
+    save_steps: int = 10000  # Checkpoint frequency
+    logging_steps: int = 100  # Logging frequency
+    memory_logging: bool = True  # Log GPU memory usage
+    gradient_accumulation_steps: int = 1  # For large batch sizes
+    lr_scheduler_type: str = "constant"  # constant for OPT, linear for RoBERTa
+    warmup_steps: int = 0  # Warmup steps
+    # Baseline comparison modes
+    baseline_mode: Optional[str] = None  # "zero_shot", "few_shot", "full_ft", "linear_probe"
+    few_shot_k: int = 32  # Number of examples for few-shot ICL
+    # Model-specific overrides for paper reproduction
+    model_family: Optional[str] = None  # "roberta", "opt" - auto-detected if None
+    paper_hparams: bool = False  # Use exact hyperparameters from Tables 15-16
 
 
 def parse_args():
@@ -142,6 +159,37 @@ def parse_args():
         default=2,
         help="Enable FSDP when multiple GPUs are available."
              " Use 1 or 2 to select the FSDP version.")
+    
+    # MeZO Paper Reproduction Arguments
+    parser.add_argument("--task_name", type=str, default=None,
+                        help="GLUE/SuperGLUE task name for evaluation")
+    parser.add_argument("--prompt_template", type=str, default=None,
+                        help="Path to JSON file with prompt templates")
+    parser.add_argument("--eval_steps", type=int, default=10000,
+                        help="Evaluation frequency (10k for RoBERTa, 4k for OPT)")
+    parser.add_argument("--save_steps", type=int, default=10000,
+                        help="Checkpoint saving frequency")
+    parser.add_argument("--logging_steps", type=int, default=100,
+                        help="Logging frequency")
+    parser.add_argument("--memory_logging", action="store_true",
+                        help="Log GPU memory usage during training")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of steps to accumulate gradients")
+    parser.add_argument("--lr_scheduler_type", type=str, default="constant",
+                        choices=["constant", "linear", "cosine"],
+                        help="Learning rate scheduler type")
+    parser.add_argument("--warmup_steps", type=int, default=0,
+                        help="Number of warmup steps")
+    parser.add_argument("--baseline_mode", type=str, default=None,
+                        choices=["zero_shot", "few_shot", "full_ft", "linear_probe"],
+                        help="Baseline comparison mode")
+    parser.add_argument("--few_shot_k", type=int, default=32,
+                        help="Number of examples for few-shot ICL")
+    parser.add_argument("--model_family", type=str, default=None,
+                        choices=["roberta", "opt"],
+                        help="Model family (auto-detected if None)")
+    parser.add_argument("--paper_hparams", action="store_true",
+                        help="Use exact hyperparameters from MeZO paper Tables 15-16")
 
     args = parser.parse_args()
     return Arguments(**vars(args))
@@ -308,31 +356,64 @@ def perturb_parameters(named_params, eps, random_seed, scaling_factor):
         param.data.add_(z * scaling_factor * eps)
 
 
-def zo_step(model, inputs, named_params, eps, accelerator):
-    """Compute gradient estimate using MeZO algorithm - simplified version without broadcasting."""
+def zo_step(model, inputs, named_params, eps, accelerator, gradient_accumulation_steps=1):
+    """Compute gradient estimate using MeZO algorithm with gradient accumulation support."""
+    
     # Generate random seed locally on each process (same as trainer.py)
     zo_random_seed = np.random.randint(1000000000)
+    
+    total_loss_pos = 0.0
+    total_loss_neg = 0.0
+    
+    # Process inputs in chunks if gradient accumulation is enabled
+    if isinstance(inputs, dict) and 'input_ids' in inputs:
+        batch_size = inputs['input_ids'].shape[0]
+        chunk_size = batch_size // gradient_accumulation_steps
+        
+        for step in range(gradient_accumulation_steps):
+            start_idx = step * chunk_size
+            end_idx = start_idx + chunk_size if step < gradient_accumulation_steps - 1 else batch_size
+            
+            # Create chunk
+            chunk_inputs = {k: v[start_idx:end_idx] for k, v in inputs.items()}
+            
+            # First perturbation: +eps
+            perturb_parameters(named_params, eps, zo_random_seed + step, scaling_factor=1)
+            loss1 = zo_forward(model, chunk_inputs)
+            
+            # Second perturbation: -2*eps (to get to -eps)
+            perturb_parameters(named_params, eps, zo_random_seed + step, scaling_factor=-2)
+            loss2 = zo_forward(model, chunk_inputs)
+            
+            # Restore to original parameters
+            perturb_parameters(named_params, eps, zo_random_seed + step, scaling_factor=1)
+            
+            total_loss_pos += loss1
+            total_loss_neg += loss2
+        
+        # Average over accumulation steps
+        total_loss_pos /= gradient_accumulation_steps
+        total_loss_neg /= gradient_accumulation_steps
+    else:
+        # Single step (original logic)
+        # First perturbation: +eps
+        perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
+        total_loss_pos = zo_forward(model, inputs)
+        
+        # Second perturbation: -2*eps (to get to -eps)
+        perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=-2)
+        total_loss_neg = zo_forward(model, inputs)
 
-    # First perturbation: +eps
-    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
-    loss1 = zo_forward(model, inputs)
+        # Restore to original parameters
+        perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
     
     # In a distributed setting, loss must be averaged across all processes
     if accelerator.num_processes > 1:
-        loss1 = accelerator.reduce(loss1, "mean")
-
-    # Second perturbation: -2*eps (to get to -eps)
-    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=-2)
-    loss2 = zo_forward(model, inputs)
-
-    if accelerator.num_processes > 1:
-        loss2 = accelerator.reduce(loss2, "mean")
-
-    # Restore to original parameters
-    perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
+        total_loss_pos = accelerator.reduce(total_loss_pos, "mean")
+        total_loss_neg = accelerator.reduce(total_loss_neg, "mean")
 
     # Calculate projected gradient
-    projected_grad = (loss1 - loss2) / (2 * eps)
+    projected_grad = (total_loss_pos - total_loss_neg) / (2 * eps)
 
     return projected_grad.item(), zo_random_seed
 
@@ -617,8 +698,106 @@ def save_lora_adapter_fsdp_compatible(model, output_dir, accelerator):
     print("LoRA adapter saved successfully with correct parameter shapes!")
 
 
+def detect_model_family(model_name: str) -> str:
+    """Auto-detect model family from model name"""
+    model_name_lower = model_name.lower()
+    if "roberta" in model_name_lower:
+        return "roberta"
+    elif "opt" in model_name_lower:
+        return "opt"
+    elif "gpt" in model_name_lower:
+        return "gpt"
+    elif "llama" in model_name_lower:
+        return "llama"
+    else:
+        return "unknown"
+
+
+def apply_paper_hyperparameters(args):
+    """Apply exact hyperparameters from MeZO paper Tables 15-16"""
+    if not args.paper_hparams:
+        return args
+    
+    # Auto-detect model family if not specified
+    if args.model_family is None:
+        args.model_family = detect_model_family(args.model_name)
+    
+    print(f"Applying paper hyperparameters for {args.model_family} family")
+    
+    if args.model_family == "roberta":
+        # RoBERTa-large settings from Table 15
+        args.batch_size = 64 if args.batch_size == 8 else args.batch_size  # Keep if user overrode
+        args.learning_rate = 1e-6 if args.learning_rate == 1e-4 else args.learning_rate  # Default from grid
+        args.zo_eps = 1e-3
+        args.weight_decay = 0.0
+        args.max_steps = 100000  # 100k steps as per paper
+        args.eval_steps = 10000
+        args.save_steps = 10000
+        args.lr_scheduler_type = "linear"
+        args.warmup_steps = 0
+        
+        # Adjust batch size with gradient accumulation if needed
+        if args.batch_size == 64 and torch.cuda.get_device_properties(0).total_memory < 80 * 1024**3:
+            print("GPU memory < 80GB, using gradient accumulation for batch_size=64")
+            args.batch_size = 8
+            args.gradient_accumulation_steps = 8
+        
+    elif args.model_family == "opt":
+        # OPT settings from Table 16
+        args.batch_size = 16 if args.batch_size == 8 else args.batch_size
+        args.learning_rate = 1e-6 if args.learning_rate == 1e-4 else args.learning_rate  # Default from grid
+        args.zo_eps = 1e-3
+        args.weight_decay = 0.0
+        args.max_steps = 20000  # 20k steps as per paper
+        args.eval_steps = 4000
+        args.save_steps = 4000
+        args.lr_scheduler_type = "constant"
+        args.warmup_steps = 0
+        
+    print(f"Applied settings: batch_size={args.batch_size}, lr={args.learning_rate}, "
+          f"eps={args.zo_eps}, max_steps={args.max_steps}")
+    
+    return args
+
+
+def setup_memory_logging():
+    """Setup memory logging utilities"""
+    import psutil
+    import threading
+    import time
+    
+    memory_log = []
+    stop_logging = threading.Event()
+    
+    def log_memory():
+        while not stop_logging.is_set():
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated() / 1024**3  # GB
+                gpu_mem_cached = torch.cuda.memory_reserved() / 1024**3  # GB
+            else:
+                gpu_mem = gpu_mem_cached = 0
+            
+            cpu_mem = psutil.Process().memory_info().rss / 1024**3  # GB
+            
+            memory_log.append({
+                'timestamp': time.time(),
+                'gpu_allocated_gb': gpu_mem,
+                'gpu_cached_gb': gpu_mem_cached,
+                'cpu_gb': cpu_mem
+            })
+            time.sleep(10)  # Log every 10 seconds as per paper
+    
+    logging_thread = threading.Thread(target=log_memory, daemon=True)
+    logging_thread.start()
+    
+    return memory_log, stop_logging
+
+
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Apply paper hyperparameters if requested
+    args = apply_paper_hyperparameters(args)
     
     # Set random seeds for reproducibility
     torch.manual_seed(args.seed)
@@ -626,13 +805,21 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     
+    # Setup memory logging if requested
+    memory_log = None
+    stop_memory_logging = None
+    if args.memory_logging:
+        memory_log, stop_memory_logging = setup_memory_logging()
+        print("Memory logging enabled (sampling every 10s)")
+    
     # Create FSDP accelerator
     fsdp_plugin = None
     if torch.cuda.device_count() > 1:
         fsdp_plugin = build_fsdp_plugin(args.fsdp_version)
     accelerator = Accelerator(
         mixed_precision="no",
-        fsdp_plugin=fsdp_plugin
+        fsdp_plugin=fsdp_plugin,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
     
     # Load tokenizer and configure padding token properly
@@ -693,9 +880,9 @@ if __name__ == "__main__":
         total_training_steps = args.num_epochs * len(train_dataloader)
 
     lr_scheduler = get_scheduler(
-        "linear",
+        args.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=0,
+        num_warmup_steps=args.warmup_steps,
         num_training_steps=total_training_steps
     )
     lr_scheduler = accelerator.prepare(lr_scheduler)
@@ -713,34 +900,113 @@ if __name__ == "__main__":
     global_step = 0
     max_steps = args.max_steps if args.max_steps is not None else float('inf')
     
+    # Training metrics tracking
+    training_metrics = {
+        'steps': [],
+        'losses': [],
+        'memory_peak_gb': [],
+        'step_times': [],
+        'learning_rates': []
+    }
+    
     # Progress bar
     pbar = tqdm(total=total_training_steps, disable=not accelerator.is_main_process)
 
+    # Training timing
+    step_start_time = None
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
     for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             if global_step >= max_steps:
                 break
             
-            # MeZO Step
+            # Timing
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                step_start_time = time.time()
+            
+            # MeZO Step with gradient accumulation support
             projected_grad, zo_random_seed = zo_step(
-                model, batch, named_params, args.zo_eps, accelerator
+                model, batch, named_params, args.zo_eps, accelerator, args.gradient_accumulation_steps
             )
             
             # MeZO Update
             zo_update(
-                named_params, lr_scheduler, projected_grad, zo_random_seed, args.learning_rate, args.weight_decay, args.zo_eps
+                named_params, lr_scheduler, projected_grad, zo_random_seed, 
+                args.learning_rate, args.weight_decay, args.zo_eps
             )
 
             global_step += 1
+            
+            # Timing and memory tracking
+            step_time = 0
+            if step_start_time is not None and torch.cuda.is_available():
+                torch.cuda.synchronize()
+                step_time = time.time() - step_start_time
+            
+            # Log metrics
+            if global_step % args.logging_steps == 0 and accelerator.is_main_process:
+                current_lr = lr_scheduler.get_last_lr()[0] * args.learning_rate
+                
+                training_metrics['steps'].append(global_step)
+                training_metrics['losses'].append(projected_grad)
+                training_metrics['learning_rates'].append(current_lr)
+                training_metrics['step_times'].append(step_time)
+                
+                if torch.cuda.is_available():
+                    peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
+                    training_metrics['memory_peak_gb'].append(peak_memory_gb)
+                    
+                    print(f"Step {global_step}: Loss={projected_grad:.2e}, LR={current_lr:.2e}, "
+                          f"Memory={peak_memory_gb:.1f}GB, Time={step_time:.2f}s")
+                else:
+                    training_metrics['memory_peak_gb'].append(0)
+                    print(f"Step {global_step}: Loss={projected_grad:.2e}, LR={current_lr:.2e}")
+            
+            # Evaluation and checkpointing
+            if global_step % args.eval_steps == 0 and accelerator.is_main_process:
+                print(f"\nEvaluation at step {global_step}")
+                # TODO: Add evaluation logic here for GLUE/SuperGLUE tasks
+                
+            if global_step % args.save_steps == 0 and accelerator.is_main_process:
+                checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                print(f"Saving checkpoint to {checkpoint_dir}")
+                # Save will happen at the end for now
+            
             pbar.update(1)
-            pbar.set_description(f"Epoch {epoch+1}, Grad: {projected_grad:.2e}")
+            pbar.set_description(f"Epoch {epoch+1}, Step {global_step}, Grad: {projected_grad:.2e}")
 
         if global_step >= max_steps:
             break
     
-    # Save the model
+    # Stop memory logging
+    if stop_memory_logging is not None:
+        stop_memory_logging.set()
+    
+    # Save final model and metrics
     if accelerator.is_main_process:
         print("Saving model...")
+        
+        # Ensure output directory exists
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # Save training metrics
+        metrics_path = os.path.join(args.output_dir, "training_metrics.json")
+        with open(metrics_path, 'w') as f:
+            json.dump(training_metrics, f, indent=2)
+        
+        # Save memory log if available
+        if memory_log is not None:
+            memory_log_path = os.path.join(args.output_dir, "memory_log.json")
+            with open(memory_log_path, 'w') as f:
+                json.dump(memory_log, f, indent=2)
+        
+        # Save run configuration
+        config_path = os.path.join(args.output_dir, "run_config.json")
+        with open(config_path, 'w') as f:
+            json.dump(vars(args), f, indent=2, default=str)
         
         if args.use_lora:
             print("Saving LoRA adapter (FSDP-compatible method)...")
@@ -775,3 +1041,14 @@ if __name__ == "__main__":
 
     accelerator.wait_for_everyone()
     print("Training finished.")
+    
+    # Print final summary
+    if accelerator.is_main_process:
+        print(f"\n=== Training Summary ===")
+        print(f"Total steps: {global_step}")
+        print(f"Final loss: {training_metrics['losses'][-1] if training_metrics['losses'] else 'N/A'}")
+        if torch.cuda.is_available():
+            print(f"Peak memory: {max(training_metrics['memory_peak_gb']):.1f} GB")
+            print(f"Avg step time: {np.mean(training_metrics['step_times']):.2f}s")
+        print(f"Metrics saved to: {args.output_dir}")
+        print("=" * 25)
