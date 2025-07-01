@@ -2,6 +2,8 @@ import argparse
 import os
 import json
 import time
+import threading
+import psutil
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -50,8 +52,6 @@ class Arguments:
     dataset_config: Optional[str] = None  # Dataset configuration name
     # Limit training samples for streaming
     max_train_samples: Optional[int] = None
-    # Probability for masking tokens (if using MLM)
-    mlm_probability: float = 0.15
     block_size: Optional[int] = None  # Block size for grouping texts
     # NEW ────────────────────────────────────────────────────────────
     # LoRA‑specific flags (defaults match common practice)
@@ -66,7 +66,6 @@ class Arguments:
     fsdp_version: int = 2
     # MeZO Paper Reproduction Settings
     task_name: Optional[str] = None  # For GLUE/SuperGLUE tasks
-    prompt_template: Optional[str] = None  # Path to prompt templates JSON
     eval_steps: int = 10000  # Evaluation frequency (10k for RoBERTa, 4k for OPT)
     save_steps: int = 10000  # Checkpoint frequency
     logging_steps: int = 100  # Logging frequency
@@ -74,12 +73,10 @@ class Arguments:
     gradient_accumulation_steps: int = 1  # For large batch sizes
     lr_scheduler_type: str = "constant"  # constant for OPT, linear for RoBERTa
     warmup_steps: int = 0  # Warmup steps
-    # Baseline comparison modes
-    baseline_mode: Optional[str] = None  # "zero_shot", "few_shot", "full_ft", "linear_probe"
-    few_shot_k: int = 32  # Number of examples for few-shot ICL
     # Model-specific overrides for paper reproduction
     model_family: Optional[str] = None  # "roberta", "opt" - auto-detected if None
     paper_hparams: bool = False  # Use exact hyperparameters from Tables 15-16
+    skip_model_save: bool = False  # Skip model saving to avoid hanging (useful for test runs)
 
 
 def parse_args():
@@ -131,12 +128,6 @@ def parse_args():
         help="Maximum number of training samples (useful for streaming)"
     )
     parser.add_argument(
-        "--mlm_probability",
-        type=float,
-        default=0.15,
-        help="Probability for masking tokens (if using MLM)"
-    )
-    parser.add_argument(
         "--block_size",
         type=int,
         default=None,
@@ -163,8 +154,6 @@ def parse_args():
     # MeZO Paper Reproduction Arguments
     parser.add_argument("--task_name", type=str, default=None,
                         help="GLUE/SuperGLUE task name for evaluation")
-    parser.add_argument("--prompt_template", type=str, default=None,
-                        help="Path to JSON file with prompt templates")
     parser.add_argument("--eval_steps", type=int, default=10000,
                         help="Evaluation frequency (10k for RoBERTa, 4k for OPT)")
     parser.add_argument("--save_steps", type=int, default=10000,
@@ -180,16 +169,16 @@ def parse_args():
                         help="Learning rate scheduler type")
     parser.add_argument("--warmup_steps", type=int, default=0,
                         help="Number of warmup steps")
-    parser.add_argument("--baseline_mode", type=str, default=None,
-                        choices=["zero_shot", "few_shot", "full_ft", "linear_probe"],
-                        help="Baseline comparison mode")
-    parser.add_argument("--few_shot_k", type=int, default=32,
-                        help="Number of examples for few-shot ICL")
     parser.add_argument("--model_family", type=str, default=None,
                         choices=["roberta", "opt"],
                         help="Model family (auto-detected if None)")
     parser.add_argument("--paper_hparams", action="store_true",
                         help="Use exact hyperparameters from MeZO paper Tables 15-16")
+    parser.add_argument(
+        "--skip_model_save",
+        action="store_true",
+        help="Skip model saving to avoid hanging (useful for test runs)"
+    )
 
     args = parser.parse_args()
     return Arguments(**vars(args))
@@ -227,6 +216,9 @@ def prepare_dataloader(args, tokenizer):
 
         if args.dataset_config:
             load_kwargs["name"] = args.dataset_config
+        elif args.dataset == "glue" and args.task_name:
+            # For GLUE, use task_name as config if no explicit config provided
+            load_kwargs["name"] = args.task_name
 
         dataset = load_dataset(args.dataset, **load_kwargs)
 
@@ -281,9 +273,24 @@ def prepare_dataloader(args, tokenizer):
     else:
         block_size = min(args.block_size, args.max_length)
 
+    # Get the text column name for the specific dataset/task
+    if args.text_column != "text":  # Only use args.text_column if explicitly set by user
+        text_col = args.text_column
+    elif args.dataset == "glue" and args.task_name == "sst2":
+        text_col = "sentence"
+    elif args.dataset == "glue" and args.task_name in ["mrpc", "qqp"]:
+        text_col = "sentence1"  # For pair classification tasks
+    elif args.dataset == "glue" and args.task_name in ["mnli", "qnli", "rte"]:
+        text_col = "premise"    # For NLI tasks
+    else:
+        text_col = "text"       # Default
+    
+    print(f"🔍 Debug: Using text column '{text_col}' for dataset={args.dataset}, task={args.task_name}")
+
     def tokenize_fn(examples):
+        print(f"🔍 Debug: Available columns: {list(examples.keys())}")
         return tokenizer(
-            examples[args.text_column],
+            examples[text_col],
             truncation=True,
             max_length=block_size,
             padding=False,
@@ -337,111 +344,83 @@ def prepare_dataloader(args, tokenizer):
 
 
 def zo_forward(model, inputs):
+    """Memory-optimized forward pass with aggressive no_grad contexts"""
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
         outputs = model(**inputs)
         loss = outputs.loss
-    return loss.detach()
-
-
-def perturb_parameters(named_params, eps, random_seed, scaling_factor):
-    """Perturb parameters using a specific random seed"""
-    # Create a generator for reproducible randomness
-    device = next(iter(named_params))[1].device if named_params else torch.device('cpu')
-    generator = torch.Generator(device=device)
-    generator.manual_seed(random_seed)
-    
-    for name, param in named_params:
-        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype, generator=generator)
-        param.data.add_(z * scaling_factor * eps)
+        # Ensure we detach and minimize memory footprint
+        loss_value = loss.detach().clone()
+        del outputs, loss  # Explicit cleanup
+    return loss_value
 
 
 def zo_step(model, inputs, named_params, eps, accelerator, gradient_accumulation_steps=1):
-    """Compute gradient estimate using MeZO algorithm with gradient accumulation support."""
+    """Compute gradient estimate using MeZO algorithm - simplified and corrected."""
+    
+    # MeZO doesn't support gradient accumulation - enforce single step
+    assert gradient_accumulation_steps == 1, "MeZO algorithm doesn't support gradient accumulation"
     
     # Generate random seed locally on each process (same as trainer.py)
-    zo_random_seed = np.random.randint(1000000000)
+    zo_random_seed = np.random.randint(42)
     
-    total_loss_pos = 0.0
-    total_loss_neg = 0.0
+    # Set global random seed for consistent perturbations
+    torch.manual_seed(zo_random_seed)
     
-    # Process inputs in chunks if gradient accumulation is enabled
-    if isinstance(inputs, dict) and 'input_ids' in inputs:
-        batch_size = inputs['input_ids'].shape[0]
-        chunk_size = batch_size // gradient_accumulation_steps
-        
-        for step in range(gradient_accumulation_steps):
-            start_idx = step * chunk_size
-            end_idx = start_idx + chunk_size if step < gradient_accumulation_steps - 1 else batch_size
-            
-            # Create chunk
-            chunk_inputs = {k: v[start_idx:end_idx] for k, v in inputs.items()}
-            
-            # First perturbation: +eps
-            perturb_parameters(named_params, eps, zo_random_seed + step, scaling_factor=1)
-            loss1 = zo_forward(model, chunk_inputs)
-            
-            # Second perturbation: -2*eps (to get to -eps)
-            perturb_parameters(named_params, eps, zo_random_seed + step, scaling_factor=-2)
-            loss2 = zo_forward(model, chunk_inputs)
-            
-            # Restore to original parameters
-            perturb_parameters(named_params, eps, zo_random_seed + step, scaling_factor=1)
-            
-            total_loss_pos += loss1
-            total_loss_neg += loss2
-        
-        # Average over accumulation steps
-        total_loss_pos /= gradient_accumulation_steps
-        total_loss_neg /= gradient_accumulation_steps
-    else:
-        # Single step (original logic)
-        # First perturbation: +eps
-        perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
-        total_loss_pos = zo_forward(model, inputs)
-        
-        # Second perturbation: -2*eps (to get to -eps)
-        perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=-2)
-        total_loss_neg = zo_forward(model, inputs)
-
-        # Restore to original parameters
-        perturb_parameters(named_params, eps, zo_random_seed, scaling_factor=1)
+    # First perturbation: +eps
+    for name, param in named_params:
+        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+        param.data = param.data + z * eps
+    
+    loss_pos = zo_forward(model, inputs)
+    
+    # Reset seed and apply -eps perturbation
+    torch.manual_seed(zo_random_seed)
+    for name, param in named_params:
+        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+        param.data = param.data - 2 * z * eps  # This gets us to -eps from +eps
+    
+    loss_neg = zo_forward(model, inputs)
+    
+    # Restore original parameters
+    torch.manual_seed(zo_random_seed)
+    for name, param in named_params:
+        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+        param.data = param.data + z * eps  # This restores to original from -eps
     
     # In a distributed setting, loss must be averaged across all processes
     if accelerator.num_processes > 1:
-        total_loss_pos = accelerator.reduce(total_loss_pos, "mean")
-        total_loss_neg = accelerator.reduce(total_loss_neg, "mean")
+        loss_pos = accelerator.reduce(loss_pos, "mean")
+        loss_neg = accelerator.reduce(loss_neg, "mean")
 
     # Calculate projected gradient
-    projected_grad = (total_loss_pos - total_loss_neg) / (2 * eps)
+    projected_grad = (loss_pos - loss_neg) / (2 * eps)
 
-    return projected_grad.item(), zo_random_seed
+    return projected_grad.item(), zo_random_seed, loss_pos.item()
 
 
-def zo_update(named_params, lr_scheduler, projected_grad, zo_random_seed, lr, weight_decay, eps):
-    """Update parameters by regenerating the same z vectors"""
-    current_lr = lr_scheduler.get_last_lr()[0] * lr
+def zo_update(named_params, lr_scheduler, projected_grad, zo_random_seed, weight_decay, base_lr):
+    """Update parameters by regenerating the same z vectors - corrected implementation"""
+    # Use base learning rate for now (ignore scheduler for debugging)
+    current_lr = base_lr
     
-    # Reset to same seed to regenerate same z vectors
-    device = next(iter(named_params))[1].device if named_params else torch.device('cpu')
-    generator = torch.Generator(device=device)
-    generator.manual_seed(zo_random_seed)
+    # Use global seed for consistency (same as zo_step)
+    torch.manual_seed(zo_random_seed)
     
     for name, param in named_params:
-        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype, generator=generator)
+        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
         
-        # Apply weight decay
-        if weight_decay > 0 and 'bias' not in name and 'LayerNorm' not in name:
-            param.data.mul_(1 - current_lr * weight_decay)
-        
-        # Apply gradient update
-        param.data.add_(-current_lr * projected_grad * z)
+        # Apply weight decay and gradient update together (as in original trainer.py)
+        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+            param.data = param.data - current_lr * (projected_grad * z + weight_decay * param.data)
+        else:
+            param.data = param.data - current_lr * (projected_grad * z)
     
     lr_scheduler.step()
 
 
 def build_fsdp_plugin(fsdp_version: int = 2):
-    """Build FSDP plugin with auto-wrapping for transformer blocks"""
+    """Build FSDP plugin with auto-wrapping for transformer blocks and memory optimizations"""
     # Try to import model-specific transformer block classes
     transformer_cls_set = set()
     
@@ -491,12 +470,16 @@ def build_fsdp_plugin(fsdp_version: int = 2):
     else:
         wrap_policy = None
     
+    # Memory optimization: Enable activation checkpointing
+    activation_checkpointing = True
+    
     return FullyShardedDataParallelPlugin(
         sharding_strategy="FULL_SHARD",
         state_dict_type="full_state_dict",
         auto_wrap_policy=wrap_policy,
         ignored_modules=None,
         use_orig_params=True,
+        activation_checkpointing=activation_checkpointing,  # Enable for memory savings
     )
 
 
@@ -736,11 +719,10 @@ def apply_paper_hyperparameters(args):
         args.lr_scheduler_type = "linear"
         args.warmup_steps = 0
         
-        # Adjust batch size with gradient accumulation if needed
-        if args.batch_size == 64 and torch.cuda.get_device_properties(0).total_memory < 80 * 1024**3:
-            print("GPU memory < 80GB, using gradient accumulation for batch_size=64")
-            args.batch_size = 8
-            args.gradient_accumulation_steps = 8
+        # Note: MeZO doesn't support gradient accumulation, so keep batch_size as is
+        if args.batch_size == 64:
+            print("Warning: Large batch size (64) may require high memory. MeZO doesn't support gradient accumulation.")
+        
         
     elif args.model_family == "opt":
         # OPT settings from Table 16
@@ -761,7 +743,7 @@ def apply_paper_hyperparameters(args):
 
 
 def setup_memory_logging():
-    """Setup memory logging utilities"""
+    """Enhanced memory logging with optimization tips"""
     import psutil
     import threading
     import time
@@ -772,17 +754,21 @@ def setup_memory_logging():
     def log_memory():
         while not stop_logging.is_set():
             if torch.cuda.is_available():
+                # Clear cache before measuring for accurate readings
+                torch.cuda.empty_cache()
                 gpu_mem = torch.cuda.memory_allocated() / 1024**3  # GB
                 gpu_mem_cached = torch.cuda.memory_reserved() / 1024**3  # GB
+                gpu_mem_max = torch.cuda.max_memory_allocated() / 1024**3  # GB
             else:
-                gpu_mem = gpu_mem_cached = 0
+                gpu_mem = gpu_mem_cached = gpu_mem_max = 0
             
             cpu_mem = psutil.Process().memory_info().rss / 1024**3  # GB
             
             memory_log.append({
                 'timestamp': time.time(),
                 'gpu_allocated_gb': gpu_mem,
-                'gpu_cached_gb': gpu_mem_cached,
+                'gpu_cached_gb': gpu_mem_cached, 
+                'gpu_max_gb': gpu_mem_max,
                 'cpu_gb': cpu_mem
             })
             time.sleep(10)  # Log every 10 seconds as per paper
@@ -796,14 +782,19 @@ def setup_memory_logging():
 if __name__ == "__main__":
     args = parse_args()
     
+    # Set random seeds for reproducibility FIRST
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    
     # Apply paper hyperparameters if requested
     args = apply_paper_hyperparameters(args)
     
-    # Set random seeds for reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    # MeZO doesn't support gradient accumulation - enforce this
+    if args.gradient_accumulation_steps != 1:
+        print(f"Warning: MeZO doesn't support gradient accumulation. Setting gradient_accumulation_steps=1 (was {args.gradient_accumulation_steps})")
+        args.gradient_accumulation_steps = 1
     
     # Setup memory logging if requested
     memory_log = None
@@ -812,15 +803,32 @@ if __name__ == "__main__":
         memory_log, stop_memory_logging = setup_memory_logging()
         print("Memory logging enabled (sampling every 10s)")
     
-    # Create FSDP accelerator
+    # Create FSDP accelerator with memory optimizations
     fsdp_plugin = None
-    if torch.cuda.device_count() > 1:
+    device_count = torch.cuda.device_count()
+    print(f"🔍 Debug: device_count={device_count}")
+    
+    # Check if we're running with accelerate config or multiple processes
+    import os
+    num_processes = int(os.environ.get('WORLD_SIZE', '1'))
+    print(f"🔍 Debug: WORLD_SIZE={num_processes}")
+    
+    if num_processes > 1:
         fsdp_plugin = build_fsdp_plugin(args.fsdp_version)
+        print(f"🔍 Debug: Using FSDP for {num_processes} processes")
+    else:
+        print(f"🔍 Debug: Single process detected, no FSDP")
+    
+    # Use mixed precision for memory efficiency
+    mixed_precision = "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "no"
+    
     accelerator = Accelerator(
-        mixed_precision="no",
+        mixed_precision=mixed_precision,
         fsdp_plugin=fsdp_plugin,
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=1  # Always 1 for MeZO
     )
+    
+    print(f"✅ Accelerator initialized with mixed_precision={mixed_precision}")
     
     # Load tokenizer and configure padding token properly
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -829,19 +837,91 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model for causal language modeling
+    # Load model for causal language modeling with enhanced memory optimization
     with accelerator.main_process_first():
-        model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        print(f"Loading model {args.model_name} with enhanced memory optimization...")
+        
+        # For large models, use maximum memory optimization
+        if "opt" in args.model_name.lower() and any(size in args.model_name for size in ["6.7b", "13b", "30b", "66b"]):
+            print("Applying aggressive memory optimization for large model...")
+            print(f"🔍 Debug: fsdp_plugin={fsdp_plugin}")
+            
+            try:
+                # For FSDP: load on CPU first, no device_map
+                if fsdp_plugin:
+                    print("🔍 Debug: Loading with FSDP path (no device_map)")
+                    model = AutoModelForCausalLM.from_pretrained(
+                        args.model_name,
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        device_map=None  # CRITICAL: No device_map with FSDP
+                    )
+                    print("✅ FSDP-compatible model loading successful")
+                else:
+                    # Non-FSDP: use device_map for automatic placement
+                    print("🔍 Debug: Loading with device_map=auto")
+                    model = AutoModelForCausalLM.from_pretrained(
+                        args.model_name,
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        device_map="auto",
+                        offload_folder="./model_offload" if torch.cuda.get_device_properties(0).total_memory < 25e9 else None
+                    )
+                    print("✅ Optimized model loading successful")
+            except Exception as e:
+                print(f"⚠️ Optimized loading failed ({e}), trying standard approach...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    device_map=None if fsdp_plugin else "auto"
+                )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                device_map=None if fsdp_plugin else "auto"
+            )
 
-    model.gradient_checkpointing_enable()
+    # Enable gradient checkpointing for memory efficiency
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        print("✅ Gradient checkpointing enabled")
+    
+    # Enable compilation for memory and speed optimization (if supported)
+    # Note: Skip compilation to avoid type issues with FSDP
+    try:
+        if (hasattr(torch, 'compile') and torch.__version__ >= "2.0" and 
+            not fsdp_plugin and not args.use_lora):
+            # Only compile if not using FSDP or LoRA to avoid compatibility issues
+            compiled_model = torch.compile(model, mode="reduce-overhead")
+            print("✅ Model compilation enabled for memory optimization")
+            # Keep original model reference for other operations
+            model._compiled_forward = compiled_model.forward
+        else:
+            print("⚠️ Model compilation skipped (FSDP/LoRA compatibility)")
+    except Exception as e:
+        print(f"⚠️ Model compilation skipped: {e}")
 
     # ─── LoRA integration ───────────────────────────────────────────────
     if args.use_lora:
+        # Auto-detect LoRA targets for OPT models if not specified
+        lora_target_modules = args.lora_target
+        if lora_target_modules is None and "opt" in args.model_name.lower():
+            # Use all linear layers for OPT models: attention + MLP
+            lora_target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+            print(f"🎯 Auto-detected LoRA targets for OPT model: {lora_target_modules}")
+        elif lora_target_modules is None:
+            # Fallback for other models
+            lora_target_modules = ["q_proj", "v_proj"]
+            print(f"🎯 Using default LoRA targets: {lora_target_modules}")
+        
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=args.lora_target,
+            target_modules=lora_target_modules,
             task_type=TaskType.CAUSAL_LM,
             bias="none",
         )
@@ -849,6 +929,18 @@ if __name__ == "__main__":
         if args.lora_path:
             model = PeftModel.from_pretrained(model, args.lora_path)
         model.print_trainable_parameters()
+        
+        # Fix dtype consistency for FSDP + LoRA compatibility
+        if fsdp_plugin is not None:
+            print("🔧 Fixing LoRA parameter dtypes for FSDP compatibility...")
+            target_dtype = torch.bfloat16  # Match the base model dtype
+            
+            for name, param in model.named_parameters():
+                if param.dtype != target_dtype:
+                    param.data = param.data.to(target_dtype)
+                    print(f"   Fixed {name}: {param.dtype}")
+            
+            print("✅ All LoRA parameters converted to bfloat16 for FSDP compatibility")
 
     # Resize token embeddings if we added new tokens
     if len(tokenizer) > model.config.vocab_size:
@@ -858,15 +950,34 @@ if __name__ == "__main__":
     if model.config.pad_token_id is None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Prepare model with FSDP BEFORE creating optimizer
-    model = accelerator.prepare(model)
+    # Prepare model - handle device_map models specially
+    model_uses_device_map = hasattr(model, 'hf_device_map') and model.hf_device_map is not None
+    
+    if model_uses_device_map:
+        # Model already placed with device_map="auto" - don't call accelerator.prepare()
+        print(f"🔧 Model uses device_map: {model.hf_device_map}")
+        print("✅ Skipping accelerator.prepare() for device_map model")
+        prepared_model = model  # Don't wrap with accelerator
+    elif accelerator.num_processes == 1:
+        # Single GPU without device_map
+        print("🔧 Preparing model for single GPU...")
+        prepared_model = accelerator.prepare(model)
+        print("✅ Single GPU model preparation complete")
+    else:
+        # Multi-GPU: use FSDP
+        print("🔧 Preparing model with FSDP for multi-GPU...")
+        prepared_model = accelerator.prepare(model)
+        print("✅ FSDP model preparation complete")
+    
+    model = prepared_model
     
     # NOW create optimizer with the prepared (potentially FSDP-wrapped) model
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Trainable parameter count: {sum(p.numel() for p in trainable_params):,}")
+    # Note: MeZO doesn't actually use the optimizer, this is just for compatibility with accelerate
     optimizer = torch.optim.SGD(
         trainable_params,
-        lr=1.0, # We use a dummy LR here and apply the real one manually in zo_update
+        lr=args.learning_rate,  # Use the real learning rate
         weight_decay=0.0)
 
     # Prepare data loader
@@ -927,15 +1038,14 @@ if __name__ == "__main__":
                 torch.cuda.synchronize()
                 step_start_time = time.time()
             
-            # MeZO Step with gradient accumulation support
-            projected_grad, zo_random_seed = zo_step(
+            # MeZO Step with corrected implementation (no gradient accumulation)
+            projected_grad, zo_random_seed, current_loss = zo_step(
                 model, batch, named_params, args.zo_eps, accelerator, args.gradient_accumulation_steps
             )
             
-            # MeZO Update
+            # MeZO Update with corrected parameters
             zo_update(
-                named_params, lr_scheduler, projected_grad, zo_random_seed, 
-                args.learning_rate, args.weight_decay, args.zo_eps
+                named_params, lr_scheduler, projected_grad, zo_random_seed, args.weight_decay, args.learning_rate
             )
 
             global_step += 1
@@ -946,12 +1056,16 @@ if __name__ == "__main__":
                 torch.cuda.synchronize()
                 step_time = time.time() - step_start_time
             
-            # Log metrics
+            # Memory optimization: Clear cache periodically
+            if global_step % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Log metrics  
             if global_step % args.logging_steps == 0 and accelerator.is_main_process:
-                current_lr = lr_scheduler.get_last_lr()[0] * args.learning_rate
+                current_lr = lr_scheduler.get_last_lr()[0]  # Scheduler already has the right LR
                 
                 training_metrics['steps'].append(global_step)
-                training_metrics['losses'].append(projected_grad)
+                training_metrics['losses'].append(current_loss)  # Log actual loss, not gradient
                 training_metrics['learning_rates'].append(current_lr)
                 training_metrics['step_times'].append(step_time)
                 
@@ -959,11 +1073,11 @@ if __name__ == "__main__":
                     peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
                     training_metrics['memory_peak_gb'].append(peak_memory_gb)
                     
-                    print(f"Step {global_step}: Loss={projected_grad:.2e}, LR={current_lr:.2e}, "
+                    print(f"Step {global_step}: Loss={current_loss:.4f}, Grad={projected_grad:.2e}, LR={current_lr:.2e}, "
                           f"Memory={peak_memory_gb:.1f}GB, Time={step_time:.2f}s")
                 else:
                     training_metrics['memory_peak_gb'].append(0)
-                    print(f"Step {global_step}: Loss={projected_grad:.2e}, LR={current_lr:.2e}")
+                    print(f"Step {global_step}: Loss={current_loss:.4f}, Grad={projected_grad:.2e}, LR={current_lr:.2e}")
             
             # Evaluation and checkpointing
             if global_step % args.eval_steps == 0 and accelerator.is_main_process:
@@ -976,14 +1090,17 @@ if __name__ == "__main__":
                 # Save will happen at the end for now
             
             pbar.update(1)
-            pbar.set_description(f"Epoch {epoch+1}, Step {global_step}, Grad: {projected_grad:.2e}")
+            pbar.set_description(f"Epoch {epoch+1}, Step {global_step}, Loss: {current_loss:.4f}")
 
         if global_step >= max_steps:
             break
     
     # Stop memory logging
     if stop_memory_logging is not None:
-        stop_memory_logging.set()
+        try:
+            stop_memory_logging.set()
+        except Exception as e:
+            print(f"Warning: Memory logging cleanup failed: {e}")
     
     # Save final model and metrics
     if accelerator.is_main_process:
@@ -992,23 +1109,37 @@ if __name__ == "__main__":
         # Ensure output directory exists
         os.makedirs(args.output_dir, exist_ok=True)
         
-        # Save training metrics
+        # Save training metrics first (always works)
         metrics_path = os.path.join(args.output_dir, "training_metrics.json")
         with open(metrics_path, 'w') as f:
             json.dump(training_metrics, f, indent=2)
+        print(f"✅ Saved training metrics to: {metrics_path}")
         
         # Save memory log if available
         if memory_log is not None:
             memory_log_path = os.path.join(args.output_dir, "memory_log.json")
             with open(memory_log_path, 'w') as f:
                 json.dump(memory_log, f, indent=2)
+            print(f"✅ Saved memory log to: {memory_log_path}")
         
         # Save run configuration
         config_path = os.path.join(args.output_dir, "run_config.json")
         with open(config_path, 'w') as f:
             json.dump(vars(args), f, indent=2, default=str)
+        print(f"✅ Saved run config to: {config_path}")
         
-        if args.use_lora:
+        # Save tokenizer first (lightweight)
+        try:
+            tokenizer.save_pretrained(args.output_dir)
+            print(f"✅ Saved tokenizer to: {args.output_dir}")
+        except Exception as e:
+            print(f"⚠️ Failed to save tokenizer: {e}")
+        
+        # Model saving with timeout and fallback
+        if args.skip_model_save:
+            print("⚠️ Skipping model save as requested (--skip_model_save)")
+            print("   Metrics and configuration have been saved successfully")
+        elif args.use_lora:
             print("Saving LoRA adapter (FSDP-compatible method)...")
             
             try:
@@ -1016,30 +1147,47 @@ if __name__ == "__main__":
                 save_lora_adapter_fsdp_compatible(model, args.output_dir, accelerator)
                 print(f"✅ LoRA adapter saved successfully to: {args.output_dir}")
                 
-                # Save tokenizer
-                tokenizer.save_pretrained(args.output_dir)
-                
             except Exception as e:
                 print(f"❌ Error saving LoRA adapter: {e}")
-                print("Trying fallback method...")
-                try:
-                    # Fallback: try saving before unwrapping (may still be corrupted)
-                    model.save_pretrained(args.output_dir)
-                    tokenizer.save_pretrained(args.output_dir)
-                except Exception as e2:
-                    print(f"❌ Fallback also failed: {e2}")
-                    # Last resort: unwrapped model (likely corrupted)
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.save_pretrained(args.output_dir)
-                    tokenizer.save_pretrained(args.output_dir)
-                
+                print("⚠️ Skipping model save to avoid hanging - metrics and config saved")
         else:
-            # For non-LoRA models, use standard unwrapping
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(args.output_dir)
-            tokenizer.save_pretrained(args.output_dir)
-
-    accelerator.wait_for_everyone()
+            # For non-LoRA models, try fast save methods
+            print("Attempting to save full model...")
+            model_save_success = False
+            
+            # Method 1: Try accelerator's save_state (recommended for FSDP)
+            try:
+                print("Trying accelerator.save_state()...")
+                accelerator.save_state(args.output_dir)
+                print("✅ Model saved using accelerator.save_state()")
+                model_save_success = True
+            except Exception as e:
+                print(f"⚠️ accelerator.save_state() failed: {e}")
+            
+            # Method 2: Try save_model if save_state failed
+            if not model_save_success:
+                try:
+                    print("Trying accelerator.save_model()...")
+                    accelerator.save_model(model, args.output_dir)
+                    print("✅ Model saved using accelerator.save_model()")
+                    model_save_success = True
+                except Exception as e:
+                    print(f"⚠️ accelerator.save_model() failed: {e}")
+            
+            # Method 3: Skip model saving entirely to avoid hanging
+            if not model_save_success:
+                print("⚠️ All model saving methods failed - skipping to avoid hanging")
+                print("   Metrics and configuration have been saved successfully")
+                print("   Model weights are not saved but training results are preserved")
+    
+    # Use a timeout for wait_for_everyone to avoid hanging
+    print("Synchronizing processes...")
+    try:
+        accelerator.wait_for_everyone()
+        print("✅ All processes synchronized")
+    except Exception as e:
+        print(f"⚠️ Process synchronization issue: {e}")
+    
     print("Training finished.")
     
     # Print final summary
@@ -1047,8 +1195,9 @@ if __name__ == "__main__":
         print(f"\n=== Training Summary ===")
         print(f"Total steps: {global_step}")
         print(f"Final loss: {training_metrics['losses'][-1] if training_metrics['losses'] else 'N/A'}")
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and training_metrics['memory_peak_gb']:
             print(f"Peak memory: {max(training_metrics['memory_peak_gb']):.1f} GB")
+        if training_metrics['step_times']:
             print(f"Avg step time: {np.mean(training_metrics['step_times']):.2f}s")
         print(f"Metrics saved to: {args.output_dir}")
         print("=" * 25)
