@@ -1082,7 +1082,50 @@ if __name__ == "__main__":
             # Evaluation and checkpointing
             if global_step % args.eval_steps == 0 and accelerator.is_main_process:
                 print(f"\nEvaluation at step {global_step}")
-                # TODO: Add evaluation logic here for GLUE/SuperGLUE tasks
+                
+                if args.dataset == "glue" and args.task_name == "sst2":
+                    # Load validation dataset
+                    eval_dataset = load_dataset("glue", "sst2", split="validation")
+                    
+                    def tokenize_eval(examples):
+                        return tokenizer(
+                            examples["sentence"],
+                            truncation=True,
+                            padding="max_length",
+                            max_length=args.max_length,
+                            return_tensors="pt"
+                        )
+                    
+                    eval_dataset = eval_dataset.map(tokenize_eval, batched=True, remove_columns=["sentence", "idx"])
+                    eval_dataloader = DataLoader(eval_dataset, batch_size=args.batch_size, collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False))
+                    
+                    model.eval()
+                    correct = 0
+                    total = 0
+                    for eval_batch in eval_dataloader:
+                        with torch.no_grad():
+                            # Move batch to device
+                            eval_batch = {k: v.to(device) for k, v in eval_batch.items()}
+                            outputs = model(**eval_batch)
+                            
+                            # Get predictions
+                            logits = outputs.logits
+                            predictions = torch.argmax(logits, dim=-1)
+                            
+                            # Get labels
+                            labels = eval_batch["labels"]
+                            
+                            # Calculate accuracy
+                            correct += (predictions == labels).sum().item()
+                            total += len(labels)
+                    
+                    accuracy = correct / total
+                    print(f"SST-2 Validation Accuracy: {accuracy:.4f}")
+                    
+                    # Add to metrics
+                    if "eval_accuracy" not in training_metrics:
+                        training_metrics["eval_accuracy"] = []
+                    training_metrics["eval_accuracy"].append(accuracy)
                 
             if global_step % args.save_steps == 0 and accelerator.is_main_process:
                 checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
